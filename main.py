@@ -389,9 +389,10 @@ def get_insider_trades(ticker: str, limit: int = 10):
         data = r.json()
 
         filings = data.get("filings", {}).get("recent", {})
-        forms       = filings.get("form", [])
-        accessions  = filings.get("accessionNumber", [])
-        dates       = filings.get("filingDate", [])
+        forms         = filings.get("form", [])
+        accessions    = filings.get("accessionNumber", [])
+        dates         = filings.get("filingDate", [])
+        primary_docs  = filings.get("primaryDocument", [])
 
         results = []
         count = 0
@@ -401,11 +402,12 @@ def get_insider_trades(ticker: str, limit: int = 10):
             if count >= limit:
                 break
 
-            accession = accessions[i].replace("-", "")
+            accession   = accessions[i].replace("-", "")
             filing_date = dates[i]
+            primary_doc = primary_docs[i] if i < len(primary_docs) else f"{accessions[i]}.xml"
 
             try:
-                xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accessions[i]}.xml"
+                xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
                 txs = parse_form4(xml_url)
                 if txs:
                     for tx in txs:
@@ -457,9 +459,10 @@ def get_insider_watchlist():
             data = r.json()
 
             filings = data.get("filings", {}).get("recent", {})
-            forms      = filings.get("form", [])
-            accessions = filings.get("accessionNumber", [])
-            dates      = filings.get("filingDate", [])
+            forms        = filings.get("form", [])
+            accessions   = filings.get("accessionNumber", [])
+            dates        = filings.get("filingDate", [])
+            primary_docs = filings.get("primaryDocument", [])
 
             recent_buys = 0
             total_value = 0
@@ -467,8 +470,9 @@ def get_insider_watchlist():
             for i, form in enumerate(forms[:50]):  # check last 50 filings
                 if form != "4":
                     continue
-                accession = accessions[i].replace("-", "")
-                xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accessions[i]}.xml"
+                accession   = accessions[i].replace("-", "")
+                primary_doc = primary_docs[i] if i < len(primary_docs) else f"{accessions[i]}.xml"
+                xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
                 txs = parse_form4(xml_url)
                 if txs:
                     for tx in txs:
