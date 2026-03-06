@@ -4,6 +4,7 @@ import yfinance as yf
 from datetime import datetime
 import logging
 import xml.etree.ElementTree as ET
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -305,8 +306,6 @@ EDGAR_HEADERS = {"User-Agent": "investment-dashboard contact@example.com"}
 def get_cik(ticker: str) -> str | None:
     """Look up SEC CIK number for a ticker."""
     try:
-        url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&forms=4"
-        # Use the company tickers JSON instead
         r = requests.get(
             "https://www.sec.gov/files/company_tickers.json",
             headers=EDGAR_HEADERS, timeout=10
@@ -320,13 +319,12 @@ def get_cik(ticker: str) -> str | None:
     return None
 
 
-def parse_form4(filing_url: str) -> dict | None:
+def parse_form4(filing_url: str) -> list | None:
     """Parse a Form 4 XML filing and extract transaction details."""
     try:
         r = requests.get(filing_url, headers=EDGAR_HEADERS, timeout=10)
         root = ET.fromstring(r.content)
 
-        ns = ""
         owner = root.find(".//reportingOwner")
         if owner is None:
             return None
@@ -406,16 +404,7 @@ def get_insider_trades(ticker: str, limit: int = 10):
             accession = accessions[i].replace("-", "")
             filing_date = dates[i]
 
-            # Build the index URL
-            index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accessions[i]}-index.htm"
-
-            # Get the filing index to find the XML
             try:
-                idx_r = requests.get(
-                    f"https://data.sec.gov/submissions/CIK{cik}.json",
-                    headers=EDGAR_HEADERS, timeout=8
-                )
-                # Direct XML URL pattern
                 xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accessions[i]}.xml"
                 txs = parse_form4(xml_url)
                 if txs:
