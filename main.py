@@ -325,6 +325,34 @@ def get_cik(ticker: str) -> str | None:
     return None
 
 
+def find_form4_xml_url(cik: str, accession_with_dashes: str, primary_doc: str) -> str | None:
+    """Find the XML document URL for a Form 4 filing."""
+    accession_no_dashes = accession_with_dashes.replace("-", "")
+    base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes}"
+
+    if primary_doc.endswith(".xml"):
+        return f"{base}/{primary_doc}"
+
+    # Fetch filing index to find the XML document
+    try:
+        idx_url = f"{base}/{accession_with_dashes}-index.json"
+        r = requests.get(idx_url, headers=EDGAR_HEADERS, timeout=5)
+        idx = r.json()
+        docs = idx.get("documents", [])
+        # Prefer a document explicitly typed as Form 4 XML
+        for doc in docs:
+            if doc.get("document", "").endswith(".xml") and doc.get("type", "") == "4":
+                return f"{base}/{doc['document']}"
+        # Fall back to any XML document in the filing
+        for doc in docs:
+            if doc.get("document", "").endswith(".xml"):
+                return f"{base}/{doc['document']}"
+    except Exception as e:
+        logger.warning(f"Filing index error for {accession_with_dashes}: {e}")
+
+    return None
+
+
 def parse_form4(filing_url: str) -> list | None:
     """Parse a Form 4 XML filing and extract transaction details."""
     try:
@@ -400,7 +428,7 @@ def get_insider_trades(ticker: str, limit: int = 3):
         dates         = filings.get("filingDate", [])
         primary_docs  = filings.get("primaryDocument", [])
 
-        # Collect up to `limit` Form 4 XML URLs first
+        # Collect up to `limit` Form 4 filings (any primary document type)
         to_fetch = []
         for i, form in enumerate(forms):
             if len(to_fetch) >= limit:
@@ -408,27 +436,26 @@ def get_insider_trades(ticker: str, limit: int = 3):
             if form != "4":
                 continue
             primary_doc = primary_docs[i] if i < len(primary_docs) else ""
-            if not primary_doc.endswith(".xml"):
-                continue
-            accession = accessions[i].replace("-", "")
-            xml_url   = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
-            to_fetch.append((xml_url, accessions[i], dates[i]))
+            to_fetch.append((cik, accessions[i], primary_doc, dates[i]))
 
-        # Fetch all XMLs in parallel
+        # Fetch all XMLs in parallel (each worker may do index lookup + XML fetch)
         results = []
         def fetch_one(item):
-            url, acc, filing_date = item
-            txs = parse_form4(url)
+            cik_local, acc_dashes, primary_doc, filing_date = item
+            xml_url = find_form4_xml_url(cik_local, acc_dashes, primary_doc)
+            if not xml_url:
+                return []
+            txs = parse_form4(xml_url)
             if txs:
                 for tx in txs:
                     tx["filing_date"] = filing_date
-                    tx["accession"]   = acc
+                    tx["accession"]   = acc_dashes
                 return txs
             return []
 
         with ThreadPoolExecutor(max_workers=limit) as pool:
             futures = {pool.submit(fetch_one, item): item for item in to_fetch}
-            for future in as_completed(futures, timeout=12):
+            for future in as_completed(futures, timeout=18):
                 try:
                     txs = future.result()
                     results.extend(txs)
