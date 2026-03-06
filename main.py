@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 from datetime import datetime
 import logging
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -296,3 +297,206 @@ def get_score(ticker: str):
     except Exception as e:
         logger.error(f"Score error for {ticker}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ─── SEC EDGAR INSIDER BUYING ─────────────────────────────────────────────────
+
+EDGAR_HEADERS = {"User-Agent": "investment-dashboard contact@example.com"}
+
+def get_cik(ticker: str) -> str | None:
+    """Look up SEC CIK number for a ticker."""
+    try:
+        url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&forms=4"
+        # Use the company tickers JSON instead
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers=EDGAR_HEADERS, timeout=10
+        )
+        data = r.json()
+        for entry in data.values():
+            if entry["ticker"].upper() == ticker.upper():
+                return str(entry["cik_str"]).zfill(10)
+    except Exception as e:
+        logger.warning(f"CIK lookup error for {ticker}: {e}")
+    return None
+
+
+def parse_form4(filing_url: str) -> dict | None:
+    """Parse a Form 4 XML filing and extract transaction details."""
+    try:
+        r = requests.get(filing_url, headers=EDGAR_HEADERS, timeout=10)
+        root = ET.fromstring(r.content)
+
+        ns = ""
+        owner = root.find(".//reportingOwner")
+        if owner is None:
+            return None
+
+        name_el = owner.find(".//rptOwnerName")
+        title_el = owner.find(".//officerTitle")
+        name  = name_el.text.strip() if name_el is not None else "Unknown"
+        title = title_el.text.strip() if title_el is not None else "Insider"
+
+        transactions = []
+        for tx in root.findall(".//nonDerivativeTransaction"):
+            tx_code_el     = tx.find(".//transactionCode")
+            shares_el      = tx.find(".//transactionShares/value")
+            price_el       = tx.find(".//transactionPricePerShare/value")
+            shares_after_el = tx.find(".//sharesOwnedFollowingTransaction/value")
+            date_el        = tx.find(".//transactionDate/value")
+
+            if tx_code_el is None:
+                continue
+
+            code = tx_code_el.text.strip() if tx_code_el.text else ""
+            # P = open market purchase, S = sale
+            if code not in ("P", "S"):
+                continue
+
+            shares = float(shares_el.text) if shares_el is not None and shares_el.text else 0
+            price  = float(price_el.text)  if price_el  is not None and price_el.text  else 0
+            date   = date_el.text.strip()  if date_el   is not None and date_el.text   else ""
+
+            transactions.append({
+                "type":        "buy" if code == "P" else "sell",
+                "shares":      shares,
+                "price":       price,
+                "value":       round(shares * price),
+                "date":        date,
+                "name":        name,
+                "title":       title,
+                "shares_after": float(shares_after_el.text) if shares_after_el is not None and shares_after_el.text else 0,
+            })
+
+        return transactions if transactions else None
+
+    except Exception as e:
+        logger.warning(f"Form 4 parse error: {e}")
+        return None
+
+
+@app.get("/insider/{ticker}")
+def get_insider_trades(ticker: str, limit: int = 10):
+    """
+    Fetch recent Form 4 insider transactions for a ticker.
+    Returns buys and sells with name, title, shares, value, date.
+    """
+    try:
+        cik = get_cik(ticker.upper())
+        if not cik:
+            raise HTTPException(status_code=404, detail=f"CIK not found for {ticker}")
+
+        # Get recent Form 4 filings
+        submissions_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        r = requests.get(submissions_url, headers=EDGAR_HEADERS, timeout=10)
+        data = r.json()
+
+        filings = data.get("filings", {}).get("recent", {})
+        forms       = filings.get("form", [])
+        accessions  = filings.get("accessionNumber", [])
+        dates       = filings.get("filingDate", [])
+
+        results = []
+        count = 0
+        for i, form in enumerate(forms):
+            if form != "4":
+                continue
+            if count >= limit:
+                break
+
+            accession = accessions[i].replace("-", "")
+            filing_date = dates[i]
+
+            # Build the index URL
+            index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accessions[i]}-index.htm"
+
+            # Get the filing index to find the XML
+            try:
+                idx_r = requests.get(
+                    f"https://data.sec.gov/submissions/CIK{cik}.json",
+                    headers=EDGAR_HEADERS, timeout=8
+                )
+                # Direct XML URL pattern
+                xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accessions[i]}.xml"
+                txs = parse_form4(xml_url)
+                if txs:
+                    for tx in txs:
+                        tx["filing_date"] = filing_date
+                        tx["accession"]   = accessions[i]
+                        results.append(tx)
+                    count += 1
+            except Exception as e:
+                logger.warning(f"Filing fetch error: {e}")
+                continue
+
+        # Filter to buys only for signal purposes, but return all
+        buys  = [t for t in results if t["type"] == "buy"]
+        sells = [t for t in results if t["type"] == "sell"]
+
+        # Cluster score: more insiders buying = higher score
+        cluster_score = min(100, len(buys) * 20)
+
+        return {
+            "ticker":        ticker.upper(),
+            "buys":          buys[:10],
+            "sells":         sells[:5],
+            "buy_count":     len(buys),
+            "sell_count":    len(sells),
+            "cluster_score": cluster_score,
+            "signal":        "bullish" if len(buys) > len(sells) else "bearish" if len(sells) > len(buys) else "neutral",
+            "updated":       datetime.utcnow().isoformat(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Insider error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/insider/watchlist/all")
+def get_insider_watchlist():
+    """Get insider activity summary for all watchlist tickers."""
+    results = []
+    for ticker in WATCHLIST:
+        try:
+            cik = get_cik(ticker)
+            if not cik:
+                continue
+
+            submissions_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+            r = requests.get(submissions_url, headers=EDGAR_HEADERS, timeout=10)
+            data = r.json()
+
+            filings = data.get("filings", {}).get("recent", {})
+            forms      = filings.get("form", [])
+            accessions = filings.get("accessionNumber", [])
+            dates      = filings.get("filingDate", [])
+
+            recent_buys = 0
+            total_value = 0
+
+            for i, form in enumerate(forms[:50]):  # check last 50 filings
+                if form != "4":
+                    continue
+                accession = accessions[i].replace("-", "")
+                xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accessions[i]}.xml"
+                txs = parse_form4(xml_url)
+                if txs:
+                    for tx in txs:
+                        if tx["type"] == "buy":
+                            recent_buys += 1
+                            total_value += tx["value"]
+
+            results.append({
+                "ticker":      ticker,
+                "recent_buys": recent_buys,
+                "total_value": total_value,
+                "signal":      "bullish" if recent_buys >= 2 else "neutral",
+            })
+
+        except Exception as e:
+            logger.warning(f"Insider watchlist error for {ticker}: {e}")
+            continue
+
+    results.sort(key=lambda x: x["recent_buys"], reverse=True)
+    return {"results": results, "updated": datetime.utcnow().isoformat()}
