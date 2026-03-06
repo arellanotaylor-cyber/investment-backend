@@ -303,15 +303,20 @@ def get_score(ticker: str):
 
 EDGAR_HEADERS = {"User-Agent": "investment-dashboard contact@example.com"}
 
+# Cache the full tickers JSON so it's only downloaded once per server process
+_tickers_cache: dict | None = None
+
 def get_cik(ticker: str) -> str | None:
     """Look up SEC CIK number for a ticker."""
+    global _tickers_cache
     try:
-        r = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=EDGAR_HEADERS, timeout=10
-        )
-        data = r.json()
-        for entry in data.values():
+        if _tickers_cache is None:
+            r = requests.get(
+                "https://www.sec.gov/files/company_tickers.json",
+                headers=EDGAR_HEADERS, timeout=15
+            )
+            _tickers_cache = r.json()
+        for entry in _tickers_cache.values():
             if entry["ticker"].upper() == ticker.upper():
                 return str(entry["cik_str"]).zfill(10)
     except Exception as e:
@@ -322,7 +327,7 @@ def get_cik(ticker: str) -> str | None:
 def parse_form4(filing_url: str) -> list | None:
     """Parse a Form 4 XML filing and extract transaction details."""
     try:
-        r = requests.get(filing_url, headers=EDGAR_HEADERS, timeout=10)
+        r = requests.get(filing_url, headers=EDGAR_HEADERS, timeout=5)
         root = ET.fromstring(r.content)
 
         owner = root.find(".//reportingOwner")
@@ -373,7 +378,7 @@ def parse_form4(filing_url: str) -> list | None:
 
 
 @app.get("/insider/{ticker}")
-def get_insider_trades(ticker: str, limit: int = 10):
+def get_insider_trades(ticker: str, limit: int = 5):
     """
     Fetch recent Form 4 insider transactions for a ticker.
     Returns buys and sells with name, title, shares, value, date.
@@ -404,7 +409,9 @@ def get_insider_trades(ticker: str, limit: int = 10):
 
             accession   = accessions[i].replace("-", "")
             filing_date = dates[i]
-            primary_doc = primary_docs[i] if i < len(primary_docs) else f"{accessions[i]}.xml"
+            primary_doc = primary_docs[i] if i < len(primary_docs) else ""
+            if not primary_doc.endswith(".xml"):
+                continue
 
             try:
                 xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
@@ -471,7 +478,9 @@ def get_insider_watchlist():
                 if form != "4":
                     continue
                 accession   = accessions[i].replace("-", "")
-                primary_doc = primary_docs[i] if i < len(primary_docs) else f"{accessions[i]}.xml"
+                primary_doc = primary_docs[i] if i < len(primary_docs) else ""
+                if not primary_doc.endswith(".xml"):
+                    continue
                 xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
                 txs = parse_form4(xml_url)
                 if txs:
