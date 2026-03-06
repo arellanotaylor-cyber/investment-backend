@@ -5,6 +5,7 @@ from datetime import datetime
 import logging
 import xml.etree.ElementTree as ET
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -327,7 +328,7 @@ def get_cik(ticker: str) -> str | None:
 def parse_form4(filing_url: str) -> list | None:
     """Parse a Form 4 XML filing and extract transaction details."""
     try:
-        r = requests.get(filing_url, headers=EDGAR_HEADERS, timeout=5)
+        r = requests.get(filing_url, headers=EDGAR_HEADERS, timeout=3)
         root = ET.fromstring(r.content)
 
         owner = root.find(".//reportingOwner")
@@ -378,7 +379,7 @@ def parse_form4(filing_url: str) -> list | None:
 
 
 @app.get("/insider/{ticker}")
-def get_insider_trades(ticker: str, limit: int = 5):
+def get_insider_trades(ticker: str, limit: int = 3):
     """
     Fetch recent Form 4 insider transactions for a ticker.
     Returns buys and sells with name, title, shares, value, date.
@@ -399,32 +400,40 @@ def get_insider_trades(ticker: str, limit: int = 5):
         dates         = filings.get("filingDate", [])
         primary_docs  = filings.get("primaryDocument", [])
 
-        results = []
-        count = 0
+        # Collect up to `limit` Form 4 XML URLs first
+        to_fetch = []
         for i, form in enumerate(forms):
+            if len(to_fetch) >= limit:
+                break
             if form != "4":
                 continue
-            if count >= limit:
-                break
-
-            accession   = accessions[i].replace("-", "")
-            filing_date = dates[i]
             primary_doc = primary_docs[i] if i < len(primary_docs) else ""
             if not primary_doc.endswith(".xml"):
                 continue
+            accession = accessions[i].replace("-", "")
+            xml_url   = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
+            to_fetch.append((xml_url, accessions[i], dates[i]))
 
-            try:
-                xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
-                txs = parse_form4(xml_url)
-                if txs:
-                    for tx in txs:
-                        tx["filing_date"] = filing_date
-                        tx["accession"]   = accessions[i]
-                        results.append(tx)
-                    count += 1
-            except Exception as e:
-                logger.warning(f"Filing fetch error: {e}")
-                continue
+        # Fetch all XMLs in parallel
+        results = []
+        def fetch_one(item):
+            url, acc, filing_date = item
+            txs = parse_form4(url)
+            if txs:
+                for tx in txs:
+                    tx["filing_date"] = filing_date
+                    tx["accession"]   = acc
+                return txs
+            return []
+
+        with ThreadPoolExecutor(max_workers=limit) as pool:
+            futures = {pool.submit(fetch_one, item): item for item in to_fetch}
+            for future in as_completed(futures, timeout=12):
+                try:
+                    txs = future.result()
+                    results.extend(txs)
+                except Exception as e:
+                    logger.warning(f"Parallel filing fetch error: {e}")
 
         # Filter to buys only for signal purposes, but return all
         buys  = [t for t in results if t["type"] == "buy"]
